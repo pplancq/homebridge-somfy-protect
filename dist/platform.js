@@ -1,0 +1,243 @@
+import { EventEmitter } from 'events';
+import { SomfyProtectAlarmAccessory } from './alarmAccessory.js';
+import { PLATFORM_NAME, PLUGIN_NAME, POLLING_CONFIG } from './settings.js';
+import { SomfyProtectApi } from './api.js';
+import { HttpApiServer } from './httpServer.js';
+/**
+ * Somfy Protect Platform
+ * Discovers and manages Somfy Protect alarm systems
+ */
+export class SomfyProtectPlatform {
+    log;
+    homebridgeApi;
+    Service;
+    Characteristic;
+    accessories = new Map();
+    events = new EventEmitter();
+    api;
+    pollingInterval;
+    config;
+    accessoryInstances = new Map();
+    httpServer;
+    constructor(log, config, homebridgeApi) {
+        this.log = log;
+        this.homebridgeApi = homebridgeApi;
+        this.config = config;
+        this.Service = homebridgeApi.hap.Service;
+        this.Characteristic = homebridgeApi.hap.Characteristic;
+        // Validate configuration
+        if (!this.config.username || !this.config.password) {
+            this.log.error('Username and password are required in config.json');
+            return;
+        }
+        this.log.debug('Finished initializing platform');
+        // Wait for Homebridge to finish loading cached accessories
+        this.homebridgeApi.on('didFinishLaunching', () => {
+            this.log.debug('Executed didFinishLaunching callback');
+            this.discoverSites();
+        });
+        // Graceful shutdown handler
+        this.homebridgeApi.on('shutdown', () => {
+            this.log.info('Homebridge is shutting down, cleaning up...');
+            this.stopPolling();
+            // Stop HTTP server
+            if (this.httpServer) {
+                this.httpServer.stop();
+            }
+            // Cleanup all accessory instances
+            for (const [, instance] of this.accessoryInstances) {
+                instance.destroy();
+            }
+            this.events.removeAllListeners();
+        });
+    }
+    /**
+     * Restore cached accessory from disk
+     */
+    configureAccessory(accessory) {
+        this.log.info('Loading accessory from cache:', accessory.displayName);
+        this.accessories.set(accessory.UUID, accessory);
+    }
+    /**
+     * Discover Somfy Protect sites and register them as accessories
+     */
+    async discoverSites() {
+        try {
+            // Initialize API client
+            this.api = new SomfyProtectApi(this.log, this.config.username, this.config.password, this.homebridgeApi.user.storagePath());
+            // Get all sites
+            const sites = await this.api.getSites();
+            if (sites.length === 0) {
+                this.log.warn('No Somfy Protect sites found on your account');
+                return;
+            }
+            // Filter to specific site if configured
+            let sitesToRegister;
+            if (this.config.siteId) {
+                const site = sites.find(s => s.site_id === this.config.siteId);
+                if (!site) {
+                    this.log.error(`Configured site ID "${this.config.siteId}" not found`);
+                    this.log.error('Available sites:');
+                    sites.forEach(s => this.log.error(`  - ${s.label} (${s.site_id})`));
+                    return;
+                }
+                sitesToRegister = [site];
+                this.log.info(`Using configured site: ${site.label}`);
+            }
+            else {
+                sitesToRegister = sites;
+                if (sites.length > 1) {
+                    this.log.warn('Multiple sites detected. Add "siteId" to config to select a specific site:');
+                    sites.forEach(s => this.log.warn(`  - ${s.label}: ${s.site_id}`));
+                }
+            }
+            // Register each site as an accessory
+            for (const site of sitesToRegister) {
+                this.registerSite(site);
+            }
+            // Remove accessories that are no longer present
+            this.removeStaleAccessories(sitesToRegister);
+            // Start polling for status updates
+            this.startPolling();
+            // Start HTTP API server if enabled
+            if (this.config.httpPort !== undefined && this.config.httpPort !== 0) {
+                this.httpServer = new HttpApiServer(this.log, this.config.httpPort, this.config.httpToken, this.disarmAllAlarms.bind(this));
+                this.httpServer.start();
+            }
+        }
+        catch (error) {
+            this.log.error('Failed to discover Somfy Protect sites:', error);
+            // Retry after delay
+            setTimeout(() => this.discoverSites(), 60000);
+        }
+    }
+    /**
+     * Register a Somfy Protect site as an accessory
+     */
+    registerSite(site) {
+        const uuid = this.homebridgeApi.hap.uuid.generate(site.site_id);
+        const existingAccessory = this.accessories.get(uuid);
+        if (existingAccessory) {
+            // Update existing accessory
+            this.log.info('Restoring existing accessory:', site.label);
+            existingAccessory.context.site = site;
+            this.homebridgeApi.updatePlatformAccessories([existingAccessory]);
+            const instance = new SomfyProtectAlarmAccessory(this, existingAccessory, this.api, this.config.enableSwitch ?? false, this.config.switchArmMode ?? 'armed');
+            this.accessoryInstances.set(uuid, instance);
+        }
+        else {
+            // Create new accessory with proper category
+            this.log.info('Adding new accessory:', site.label);
+            const accessory = new this.homebridgeApi.platformAccessory(site.label, uuid, 11 /* this.homebridgeApi.hap.Categories.SECURITY_SYSTEM */);
+            accessory.context.site = site;
+            const instance = new SomfyProtectAlarmAccessory(this, accessory, this.api, this.config.enableSwitch ?? false, this.config.switchArmMode ?? 'armed');
+            this.accessoryInstances.set(uuid, instance);
+            this.homebridgeApi.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
+            this.accessories.set(uuid, accessory);
+        }
+    }
+    /**
+     * Remove accessories that no longer exist
+     */
+    removeStaleAccessories(currentSites) {
+        const currentUUIDs = new Set(currentSites.map(site => this.homebridgeApi.hap.uuid.generate(site.site_id)));
+        const accessoriesToRemove = [];
+        for (const [uuid, accessory] of this.accessories) {
+            if (!currentUUIDs.has(uuid)) {
+                this.log.info('Removing stale accessory:', accessory.displayName);
+                // Cleanup accessory instance
+                const instance = this.accessoryInstances.get(uuid);
+                if (instance) {
+                    instance.destroy();
+                    this.accessoryInstances.delete(uuid);
+                }
+                accessoriesToRemove.push(accessory);
+                this.accessories.delete(uuid);
+            }
+        }
+        if (accessoriesToRemove.length > 0) {
+            this.homebridgeApi.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, accessoriesToRemove);
+        }
+    }
+    /**
+     * Start polling for status updates
+     */
+    startPolling() {
+        if (this.pollingInterval) {
+            return;
+        }
+        const interval = this.config.pollingInterval || POLLING_CONFIG.INITIAL_INTERVAL;
+        this.log.debug(`Starting status polling every ${interval}ms`);
+        this.pollingInterval = setInterval(() => {
+            this.pollStatus();
+        }, interval);
+        // Do an immediate poll
+        this.pollStatus();
+    }
+    /**
+     * Poll for status updates
+     */
+    async pollStatus() {
+        try {
+            for (const [, accessory] of this.accessories) {
+                const site = accessory.context.site;
+                const updatedSite = await this.api.getSite(site.site_id);
+                // Emit event to notify accessory of update (EventEmitter pattern)
+                this.events.emit('siteUpdated', site.site_id, updatedSite);
+            }
+        }
+        catch (error) {
+            this.log.debug('Polling error (will retry):', error instanceof Error ? error.message : error);
+        }
+    }
+    /**
+     * Stop polling (called on shutdown)
+     */
+    stopPolling() {
+        if (this.pollingInterval) {
+            clearInterval(this.pollingInterval);
+            this.pollingInterval = undefined;
+            this.log.debug('Stopped status polling');
+        }
+    }
+    /**
+     * Disarm all alarm systems (called by HTTP API)
+     */
+    async disarmAllAlarms() {
+        this.log.info('Disarming all alarm systems via HTTP API');
+        const disarmPromises = [];
+        for (const [uuid] of this.accessoryInstances) {
+            const accessory = this.accessories.get(uuid);
+            if (accessory) {
+                const site = accessory.context.site;
+                // Only disarm if not already disarmed
+                if (site.security_level !== 'disarmed') {
+                    this.log.info(`Disarming ${site.label}`);
+                    disarmPromises.push(this.api.setSecurityLevel(site.site_id, 'disarmed')
+                        .then(() => {
+                        // Update local cache
+                        site.security_level = 'disarmed';
+                        accessory.context.site = site;
+                        // Notify the accessory instance
+                        this.events.emit('siteUpdated', site.site_id, site);
+                    })
+                        .catch((error) => {
+                        this.log.error(`Failed to disarm ${site.label}:`, error);
+                        throw error;
+                    }));
+                }
+                else {
+                    this.log.debug(`${site.label} is already disarmed`);
+                }
+            }
+        }
+        if (disarmPromises.length === 0) {
+            this.log.info('All alarm systems are already disarmed');
+            return;
+        }
+        // Wait for all disarm commands to complete
+        await Promise.all(disarmPromises);
+        this.log.info('All alarm systems disarmed successfully');
+    }
+}
+//# sourceMappingURL=platform.js.map
