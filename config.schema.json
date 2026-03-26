@@ -60,6 +60,19 @@
         "type": "string",
         "placeholder": "Optional security token",
         "description": "Optional token for securing the HTTP API. If set, requests must include 'Authorization: Bearer YOUR_TOKEN' header."
+      },
+      "enableSwitch": {
+        "title": "🔘 Enable Arm/Disarm Switch",
+        "type": "boolean",
+        "default": false,
+        "description": "Adds a Switch to the alarm accessory. Useful for Apple Home automations (e.g. arm when you leave, disarm when you arrive)."
+      },
+      "switchArmMode": {
+        "title": "Arm mode for Switch ON",
+        "type": "string",
+        "default": "armed",
+        "enum": ["armed", "partial"],
+        "description": "Security level applied when the switch is turned ON. 'armed' = full away mode, 'partial' = stay/home mode."
       }
     }
   },
@@ -94,6 +107,16 @@
       "items": [
         "httpPort",
         "httpToken"
+      ]
+    },
+    {
+      "type": "fieldset",
+      "title": "Arm/Disarm Switch",
+      "expandable": true,
+      "expanded": false,
+      "items": [
+        "enableSwitch",
+        "switchArmMode"
       ]
     }
   ]

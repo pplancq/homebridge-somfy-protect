@@ -160,7 +160,11 @@ export class SomfyProtectPlatform implements DynamicPlatformPlugin {
       this.log.info('Restoring existing accessory:', site.label);
       existingAccessory.context.site = site;
       this.homebridgeApi.updatePlatformAccessories([existingAccessory]);
-      const instance = new SomfyProtectAlarmAccessory(this, existingAccessory, this.api);
+      const instance = new SomfyProtectAlarmAccessory(
+        this, existingAccessory, this.api,
+        this.config.enableSwitch ?? false,
+        this.config.switchArmMode ?? 'armed',
+      );
       this.accessoryInstances.set(uuid, instance);
     } else {
       // Create new accessory with proper category
@@ -171,7 +175,11 @@ export class SomfyProtectPlatform implements DynamicPlatformPlugin {
         this.homebridgeApi.hap.Categories.SECURITY_SYSTEM,
       );
       accessory.context.site = site;
-      const instance = new SomfyProtectAlarmAccessory(this, accessory, this.api);
+      const instance = new SomfyProtectAlarmAccessory(
+        this, accessory, this.api,
+        this.config.enableSwitch ?? false,
+        this.config.switchArmMode ?? 'armed',
+      );
       this.accessoryInstances.set(uuid, instance);
       this.homebridgeApi.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
       this.accessories.set(uuid, accessory);

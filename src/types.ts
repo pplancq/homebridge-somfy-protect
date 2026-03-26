@@ -12,6 +12,8 @@ export interface SomfyProtectConfig {
   debug?: boolean;
   httpPort?: number;
   httpToken?: string;
+  enableSwitch?: boolean;
+  switchArmMode?: SecurityLevel;
 }
 
 export interface OAuthToken {

@@ -11,6 +11,8 @@ describe('SomfyProtectAlarmAccessory', () => {
   let mockApi: jest.Mocked<SomfyProtectApi>;
   let mockService: jest.Mocked<Service>;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let mockSwitchService: any;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   let mockCharacteristic: any;
 
   const mockSite = {
@@ -43,7 +45,19 @@ describe('SomfyProtectAlarmAccessory', () => {
         NO_FAULT: 0,
         GENERAL_FAULT: 1,
       },
+      On: 'On',
     };
+
+    // Mock switch service
+    mockSwitchService = {
+      getCharacteristic: jest.fn().mockReturnThis(),
+      updateCharacteristic: jest.fn().mockReturnThis(),
+      setCharacteristic: jest.fn().mockReturnThis(),
+      setProps: jest.fn().mockReturnThis(),
+      onGet: jest.fn().mockReturnThis(),
+      onSet: jest.fn().mockReturnThis(),
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    } as any;
 
     // Mock service
     mockService = {
@@ -58,7 +72,7 @@ describe('SomfyProtectAlarmAccessory', () => {
 
     // Mock platform
     mockPlatform = {
-      Service: { SecuritySystem: jest.fn(), AccessoryInformation: jest.fn() },
+      Service: { SecuritySystem: jest.fn(), AccessoryInformation: jest.fn(), Switch: 'Switch' },
       Characteristic: mockCharacteristic,
       log: {
         info: jest.fn(),
@@ -96,9 +110,18 @@ describe('SomfyProtectAlarmAccessory', () => {
         if (service === mockPlatform.Service.AccessoryInformation) {
           return mockInfoService;
         }
+        if (service === mockPlatform.Service.Switch) {
+          return null; // Switch not cached by default
+        }
         return mockService;
       }),
-      addService: jest.fn().mockReturnValue(mockService),
+      addService: jest.fn().mockImplementation((service) => {
+        if (service === mockPlatform.Service.Switch) {
+          return mockSwitchService;
+        }
+        return mockService;
+      }),
+      removeService: jest.fn(),
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     } as any;
 
@@ -137,7 +160,8 @@ describe('SomfyProtectAlarmAccessory', () => {
     });
 
     it('should set valid values for characteristics', () => {
-      expect(mockService.setProps).toHaveBeenCalledWith({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      expect((mockService as any).setProps).toHaveBeenCalledWith({
         validValues: [
           mockCharacteristic.SecuritySystemCurrentState.STAY_ARM,
           mockCharacteristic.SecuritySystemCurrentState.AWAY_ARM,
@@ -321,13 +345,147 @@ describe('SomfyProtectAlarmAccessory', () => {
     });
   });
 
+  describe('arm/disarm switch', () => {
+    beforeEach(() => {
+      // Recreate accessory with switch enabled
+      accessory = new SomfyProtectAlarmAccessory(mockPlatform, mockAccessory, mockApi, true, 'armed');
+    });
+
+    it('should add a Switch service when enableSwitch is true', () => {
+      expect(mockAccessory.addService).toHaveBeenCalledWith(
+        mockPlatform.Service.Switch,
+        `${mockSite.label} Switch`,
+        'arm-switch',
+      );
+    });
+
+    it('should not add a Switch service when enableSwitch is false', () => {
+      jest.clearAllMocks();
+      accessory = new SomfyProtectAlarmAccessory(mockPlatform, mockAccessory, mockApi, false);
+      expect(mockAccessory.addService).not.toHaveBeenCalledWith(
+        mockPlatform.Service.Switch,
+        expect.anything(),
+        expect.anything(),
+      );
+    });
+
+    it('should remove existing Switch service when enableSwitch is false (migration)', () => {
+      // Simulate cached switch service from previous config
+      (mockAccessory.getService as jest.Mock).mockImplementation((service) => {
+        if (service === mockPlatform.Service.Switch) {
+          return mockSwitchService;
+        }
+        return mockService;
+      });
+      jest.clearAllMocks();
+      accessory = new SomfyProtectAlarmAccessory(mockPlatform, mockAccessory, mockApi, false);
+      expect(mockAccessory.removeService).toHaveBeenCalledWith(mockSwitchService);
+    });
+
+    it('should return false (OFF) when site is disarmed', () => {
+      mockAccessory.context.site.security_level = 'disarmed';
+      // Access private method via event-driven path
+      const updatedSite = { ...mockSite, security_level: 'disarmed' as const };
+      mockPlatform.events.emit('siteUpdated', 'test-site-id', updatedSite);
+      expect(mockSwitchService.updateCharacteristic).toHaveBeenCalledWith(
+        mockCharacteristic.On,
+        false,
+      );
+    });
+
+    it('should return true (ON) when site is armed and switchArmMode is armed', () => {
+      const updatedSite = { ...mockSite, security_level: 'armed' as const };
+      mockPlatform.events.emit('siteUpdated', 'test-site-id', updatedSite);
+      expect(mockSwitchService.updateCharacteristic).toHaveBeenCalledWith(
+        mockCharacteristic.On,
+        true,
+      );
+    });
+
+    it('should return true (ON) when site is partial (night mode), regardless of switchArmMode', () => {
+      const updatedSite = { ...mockSite, security_level: 'partial' as const };
+      mockPlatform.events.emit('siteUpdated', 'test-site-id', updatedSite);
+      expect(mockSwitchService.updateCharacteristic).toHaveBeenCalledWith(
+        mockCharacteristic.On,
+        true,
+      );
+    });
+
+    it('should also return true (ON) for partial when switchArmMode is partial', () => {
+      accessory = new SomfyProtectAlarmAccessory(mockPlatform, mockAccessory, mockApi, true, 'partial');
+      jest.clearAllMocks();
+      const updatedSite = { ...mockSite, security_level: 'partial' as const };
+      mockPlatform.events.emit('siteUpdated', 'test-site-id', updatedSite);
+      expect(mockSwitchService.updateCharacteristic).toHaveBeenCalledWith(
+        mockCharacteristic.On,
+        true,
+      );
+    });
+
+    it('should call setSecurityLevel with armed when switch is turned ON', async () => {
+      // Simulate the onSet handler being triggered
+      const onSetCall = (mockSwitchService.onSet as jest.Mock).mock.calls[0];
+      const onSetHandler = onSetCall?.[0];
+      if (onSetHandler) {
+        await onSetHandler(true);
+        expect(mockApi.setSecurityLevel).toHaveBeenCalledWith('test-site-id', 'armed');
+      }
+    });
+
+    it('should call setSecurityLevel with disarmed when switch is turned OFF', async () => {
+      const onSetCall = (mockSwitchService.onSet as jest.Mock).mock.calls[0];
+      const onSetHandler = onSetCall?.[0];
+      if (onSetHandler) {
+        await onSetHandler(false);
+        expect(mockApi.setSecurityLevel).toHaveBeenCalledWith('test-site-id', 'disarmed');
+      }
+    });
+
+    it('should sync SecuritySystem characteristics when switch is toggled', async () => {
+      const onSetCall = (mockSwitchService.onSet as jest.Mock).mock.calls[0];
+      const onSetHandler = onSetCall?.[0];
+      if (onSetHandler) {
+        await onSetHandler(true);
+        expect(mockService.updateCharacteristic).toHaveBeenCalledWith(
+          mockCharacteristic.SecuritySystemCurrentState,
+          mockCharacteristic.SecuritySystemCurrentState.AWAY_ARM,
+        );
+        expect(mockService.updateCharacteristic).toHaveBeenCalledWith(
+          mockCharacteristic.SecuritySystemTargetState,
+          mockCharacteristic.SecuritySystemTargetState.AWAY_ARM,
+        );
+      }
+    });
+
+    it('should also sync switch when setTargetState is called', async () => {
+      await accessory.setTargetState(mockCharacteristic.SecuritySystemTargetState.AWAY_ARM);
+      expect(mockSwitchService.updateCharacteristic).toHaveBeenCalledWith(
+        mockCharacteristic.On,
+        true,
+      );
+    });
+
+    it('should revert switch state on API error', async () => {
+      mockApi.setSecurityLevel.mockRejectedValueOnce(new Error('API error'));
+      const onSetCall = (mockSwitchService.onSet as jest.Mock).mock.calls[0];
+      const onSetHandler = onSetCall?.[0];
+      if (onSetHandler) {
+        await expect(onSetHandler(true)).rejects.toThrow();
+        expect(mockSwitchService.updateCharacteristic).toHaveBeenCalledWith(
+          mockCharacteristic.On,
+          false, // disarmed → switch OFF
+        );
+      }
+    });
+  });
+
   describe('destroy', () => {
     it('should remove event listeners', () => {
-      const listenerCount = mockPlatform.events.listenerCount('siteUpdated');
+      const listenerCountBefore = mockPlatform.events.listenerCount('siteUpdated');
 
       accessory.destroy();
 
-      expect(mockPlatform.events.listenerCount('siteUpdated')).toBeLessThan(listenerCount);
+      expect(mockPlatform.events.listenerCount('siteUpdated')).toBeLessThan(listenerCountBefore);
       expect(mockPlatform.log.debug).toHaveBeenCalledWith('Cleaned up alarm accessory');
     });
   });

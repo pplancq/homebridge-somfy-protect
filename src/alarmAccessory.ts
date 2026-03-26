@@ -10,13 +10,17 @@ import { SomfyProtectApiError } from './types.js';
  */
 export class SomfyProtectAlarmAccessory {
   private service: Service;
+  private switchService?: Service;
   private isReachable = true;
   private readonly STALENESS_THRESHOLD = 60000; // 60 seconds
+  private readonly boundHandleSiteUpdate: (siteId: string, updatedSite: Site) => void;
 
   constructor(
     private readonly platform: SomfyProtectPlatform,
     private readonly accessory: PlatformAccessory,
     private readonly api: SomfyProtectApi,
+    private readonly enableSwitch = false,
+    private readonly switchArmMode: SecurityLevel = 'armed',
   ) {
     const site = this.accessory.context.site as Site;
 
@@ -67,7 +71,19 @@ export class SomfyProtectAlarmAccessory {
       .onGet(this.getStatusFault.bind(this));
 
     // Listen for site updates from platform (EventEmitter pattern)
-    this.platform.events.on('siteUpdated', this.handleSiteUpdate.bind(this));
+    this.boundHandleSiteUpdate = this.handleSiteUpdate.bind(this);
+    this.platform.events.on('siteUpdated', this.boundHandleSiteUpdate);
+
+    // Setup optional arm/disarm switch
+    if (this.enableSwitch) {
+      this.setupSwitchService();
+    } else {
+      // Remove switch service if it was previously enabled (config migration)
+      const existingSwitch = this.accessory.getService(this.platform.Service.Switch);
+      if (existingSwitch) {
+        this.accessory.removeService(existingSwitch);
+      }
+    }
 
     // Set initial state
     this.updateCharacteristics();
@@ -121,6 +137,80 @@ export class SomfyProtectAlarmAccessory {
     default:
       this.platform.log.warn(`Unknown target state: ${state}`);
       return 'disarmed';
+    }
+  }
+
+  /**
+   * Setup optional arm/disarm Switch service
+   */
+  private setupSwitchService(): void {
+    const site = this.accessory.context.site as Site;
+    this.switchService = this.accessory.getService(this.platform.Service.Switch)
+      || this.accessory.addService(this.platform.Service.Switch, `${site.label} Switch`, 'arm-switch');
+
+    this.switchService.setCharacteristic(this.platform.Characteristic.Name, `${site.label} Switch`);
+
+    this.switchService.getCharacteristic(this.platform.Characteristic.On)
+      .onGet(this.getSwitchState.bind(this))
+      .onSet(this.setSwitchState.bind(this));
+  }
+
+  /**
+   * Returns true if the current security level should turn the switch ON.
+   * Any armed state (armed or partial) turns the switch ON.
+   * Only disarmed turns it OFF.
+   */
+  private isSwitchOn(level: SecurityLevel): boolean {
+    return level !== 'disarmed';
+  }
+
+  /**
+   * Get the switch state based on the current security level
+   */
+  private getSwitchState(): CharacteristicValue {
+    const site = this.accessory.context.site as Site;
+    return this.isSwitchOn(site.security_level);
+  }
+
+  /**
+   * Handle switch ON/OFF: arm or disarm the alarm
+   */
+  private async setSwitchState(value: CharacteristicValue): Promise<void> {
+    const site = this.accessory.context.site as Site;
+    const targetLevel: SecurityLevel = value ? this.switchArmMode : 'disarmed';
+
+    this.platform.log.info(`Switch: setting ${site.label} to ${targetLevel}`);
+
+    try {
+      await this.api.setSecurityLevel(site.site_id, targetLevel);
+
+      // Update local cache optimistically
+      site.security_level = targetLevel;
+      this.accessory.context.site = site;
+
+      // Sync SecuritySystem characteristics
+      this.service.updateCharacteristic(
+        this.platform.Characteristic.SecuritySystemCurrentState,
+        this.somfyToHomekitCurrentState(targetLevel),
+      );
+      this.service.updateCharacteristic(
+        this.platform.Characteristic.SecuritySystemTargetState,
+        this.somfyToHomekitTargetState(targetLevel),
+      );
+
+      this.platform.log.info(`Switch: successfully set ${site.label} to ${targetLevel}`);
+    } catch (error) {
+      this.handleError('setting switch state', error);
+
+      // Revert switch to actual state on error
+      this.switchService?.updateCharacteristic(
+        this.platform.Characteristic.On,
+        this.isSwitchOn(site.security_level),
+      );
+
+      throw new this.platform.homebridgeApi.hap.HapStatusError(
+        this.platform.homebridgeApi.hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE,
+      );
     }
   }
 
@@ -198,6 +288,12 @@ export class SomfyProtectAlarmAccessory {
         this.somfyToHomekitCurrentState(targetLevel),
       );
 
+      // Sync switch if enabled
+      this.switchService?.updateCharacteristic(
+        this.platform.Characteristic.On,
+        this.isSwitchOn(targetLevel),
+      );
+
       this.platform.log.info(`Successfully set ${site.label} to ${targetLevel}`);
 
     } catch (error) {
@@ -272,6 +368,14 @@ export class SomfyProtectAlarmAccessory {
       targetState,
     );
 
+    // Sync switch state
+    if (this.switchService) {
+      this.switchService.updateCharacteristic(
+        this.platform.Characteristic.On,
+        this.isSwitchOn(site.security_level),
+      );
+    }
+
     this.platform.log.debug(`Updated characteristics for ${site.label}: ${site.security_level}`);
   }
 
@@ -306,8 +410,7 @@ export class SomfyProtectAlarmAccessory {
    * Cleanup method (called on shutdown)
    */
   public destroy(): void {
-    // Remove event listeners
-    this.platform.events.removeListener('siteUpdated', this.handleSiteUpdate.bind(this));
+    this.platform.events.removeListener('siteUpdated', this.boundHandleSiteUpdate);
     this.platform.log.debug('Cleaned up alarm accessory');
   }
 }
